@@ -15,14 +15,67 @@ var path = require('path');
 var fs = require('fs');
 var webpack = require('webpack');
 var rimraf = require('rimraf');
-var CommonsChunkPlugin = require('webpack/lib/optimize/CommonsChunkPlugin');
+var _ = require('lodash');
+var ExtractTextPlugin = require('extract-text-webpack-plugin');
+var extractTextPluginMajorVersion = require('extract-text-webpack-plugin/package.json').version.split('.')[0];
+var webpackMajorVersion = Number(require('webpack/package.json').version.split('.')[0]);
+if (isNaN(webpackMajorVersion)) {
+  throw new Error('Cannot parse webpack major version');
+}
+if (webpackMajorVersion < 4) {
+  var CommonsChunkPlugin = require('webpack/lib/optimize/CommonsChunkPlugin');
+}
 var HtmlWebpackPlugin = require('../index.js');
+
+if (Number(extractTextPluginMajorVersion) > 1) {
+  var extractOriginal = ExtractTextPlugin.extract;
+  ExtractTextPlugin.extract = function (fallback, use) {
+    return extractOriginal({
+      fallback: fallback,
+      use: use
+    });
+  };
+}
 
 var OUTPUT_DIR = path.join(__dirname, '../dist');
 
 jasmine.getEnv().defaultTimeoutInterval = 30000;
 
+function transformCommonChunkConfigToOptimization (config) {
+  if (config.name === 'common') {
+    return {
+      splitChunks: {
+        cacheGroups: {
+          commons: {
+            chunks: 'initial',
+            name: config.name,
+            enforce: true
+          }
+        }
+      }
+    };
+  } else {
+    throw new Error('Unrecognized common chunk config');
+  }
+}
+
 function testHtmlPlugin (webpackConfig, expectedResults, outputFile, done, expectErrors, expectWarnings) {
+  if (webpackMajorVersion >= 4) {
+    webpackConfig.mode = 'development';
+    if (webpackConfig.module && webpackConfig.module.loaders) {
+      webpackConfig.module.rules = webpackConfig.module.loaders;
+      delete webpackConfig.module.loaders;
+    }
+  }
+  if (webpackConfig.__commonsChunk) {
+    if (webpackMajorVersion < 4) {
+      webpackConfig.plugins = webpackConfig.plugins || [];
+      webpackConfig.plugins.unshift(new CommonsChunkPlugin(webpackConfig.__commonsChunk));
+    } else {
+      webpackConfig.optimization = transformCommonChunkConfigToOptimization(webpackConfig.__commonsChunk);
+    }
+    delete webpackConfig.__commonsChunk;
+  }
   outputFile = outputFile || 'index.html';
   webpack(webpackConfig, function (err, stats) {
     expect(err).toBeFalsy();
@@ -84,6 +137,26 @@ function getChunksInfoFromStats (stats) {
     }
   }
   return chunksInfo;
+}
+
+function tapCompilationEvent (compilation, eventName, handler) {
+  // Webpack 4 has a new interface
+  if (compilation.hooks) {
+    return compilation.hooks[trainCaseToCamelCase(eventName)].tapAsync(
+      'AsyncPlugin' + tapCompilationEvent.counter++,
+      handler
+    );
+  } else {
+    return compilation.plugin(eventName, handler);
+  }
+}
+// There's probably a better way to do this
+tapCompilationEvent.counter = 0;
+
+function trainCaseToCamelCase (word) {
+  return word.replace(/-([\w])/g, function (match, p1) {
+    return p1.toUpperCase();
+  });
 }
 
 describe('HtmlWebpackPlugin', function () {
@@ -404,7 +477,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should work with the css extract plugin', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -424,7 +496,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should work with the css extract plugin on windows and protocol relative urls support (#205)', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -445,7 +516,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should allow to add cache hashes to with the css assets', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -465,7 +535,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should inject css files when using the extract text plugin', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -485,7 +554,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should allow to add cache hashes to with injected css assets', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -505,7 +573,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should output xhtml link stylesheet tag', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -683,7 +750,6 @@ describe('HtmlWebpackPlugin', function () {
   });
 
   it('should inject js css files even if the html file is incomplete', function (done) {
-    var ExtractTextPlugin = require('extract-text-webpack-plugin');
     testHtmlPlugin({
       entry: path.join(__dirname, 'fixtures/theme.js'),
       output: {
@@ -722,7 +788,7 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-alter-asset-tags', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-alter-asset-tags', function (object, callback) {
             expect(typeof object.body).toBe('object');
             expect(typeof object.head).toBe('object');
             eventFired = true;
@@ -731,6 +797,8 @@ describe('HtmlWebpackPlugin', function () {
         });
       }
     };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
     testHtmlPlugin({
       entry: {
         app: path.join(__dirname, 'fixtures/index.js')
@@ -746,7 +814,107 @@ describe('HtmlWebpackPlugin', function () {
     }, [], null, function () {
       expect(eventFired).toBe(true);
       done();
-    });
+    }, false,
+    shouldExpectWarnings);
+  });
+
+  it('passes chunks to the html-webpack-plugin-alter-asset-tags event', function (done) {
+    var chunks;
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-alter-asset-tags', function (object, callback) {
+            chunks = object.chunks;
+            callback();
+          });
+        });
+      }
+    };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin
+      ]
+    }, [], null, function () {
+      expect(chunks).toBeDefined();
+      done();
+    }, false,
+    shouldExpectWarnings);
+  });
+
+  it('allows events to add a no-value attribute', function (done) {
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-alter-asset-tags', function (pluginArgs, callback) {
+            pluginArgs.body = pluginArgs.body.map(function (tag) {
+              if (tag.tagName === 'script') {
+                tag.attributes.async = true;
+              }
+              return tag;
+            });
+            callback(null, pluginArgs);
+          });
+        });
+      }
+    };
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin
+      ]
+    },
+    [/<body>[\s]*<script type="text\/javascript" src="app_bundle.js" async><\/script>[\s]*<\/body>/],
+    null, done, false, false);
+  });
+
+  it('allows events to remove an attribute by setting it to false', function (done) {
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-alter-asset-tags', function (pluginArgs, callback) {
+            pluginArgs.body = pluginArgs.body.map(function (tag) {
+              if (tag.tagName === 'script') {
+                tag.attributes.async = false;
+              }
+              return tag;
+            });
+            callback(null, pluginArgs);
+          });
+        });
+      }
+    };
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin
+      ]
+    },
+    [/<body>[\s]*<script type="text\/javascript" src="app_bundle.js"><\/script>[\s]*<\/body>/],
+    null, done, false, false);
   });
 
   it('fires the html-webpack-plugin-before-html-processing event', function (done) {
@@ -754,13 +922,15 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-before-html-processing', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-before-html-processing', function (object, callback) {
             eventFired = true;
             callback();
           });
         });
       }
     };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
     testHtmlPlugin({
       entry: {
         app: path.join(__dirname, 'fixtures/index.js')
@@ -776,7 +946,8 @@ describe('HtmlWebpackPlugin', function () {
     }, [], null, function () {
       expect(eventFired).toBe(true);
       done();
-    });
+    }, false,
+    shouldExpectWarnings);
   });
 
   it('fires the html-webpack-plugin-after-html-processing event', function (done) {
@@ -784,13 +955,14 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-after-html-processing', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
             eventFired = true;
             callback();
           });
         });
       }
     };
+    var shouldExpectWarnings = webpackMajorVersion < 4;
     testHtmlPlugin({
       entry: {
         app: path.join(__dirname, 'fixtures/index.js')
@@ -806,7 +978,8 @@ describe('HtmlWebpackPlugin', function () {
     }, [], null, function () {
       expect(eventFired).toBe(true);
       done();
-    });
+    }, false,
+    shouldExpectWarnings);
   });
 
   it('fires the html-webpack-plugin-after-emit event', function (done) {
@@ -814,7 +987,7 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-after-emit', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-emit', function (object, callback) {
             eventFired = true;
             callback();
           });
@@ -844,7 +1017,7 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-after-html-processing', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
             eventFired = true;
             object.html += 'Injected by plugin';
             callback();
@@ -852,6 +1025,8 @@ describe('HtmlWebpackPlugin', function () {
         });
       }
     };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
     testHtmlPlugin({
       entry: {
         app: path.join(__dirname, 'fixtures/index.js')
@@ -867,6 +1042,155 @@ describe('HtmlWebpackPlugin', function () {
     }, ['Injected by plugin'], null, function () {
       expect(eventFired).toBe(true);
       done();
+    }, false,
+    shouldExpectWarnings);
+  });
+
+  it('allows to modify sequentially the html during html-webpack-plugin-after-html-processing event by edit the given arguments object', function (done) {
+    var eventFiredForFirstPlugin = false;
+    var eventFiredForSecondPlugin = false;
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForFirstPlugin = true;
+            object.html += 'Injected by first plugin';
+            callback(null, object);
+          });
+        });
+      }
+    };
+    var secondExamplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForSecondPlugin = true;
+            object.html += ' Injected by second plugin';
+            callback(null);
+          });
+        });
+      }
+    };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin,
+        secondExamplePlugin
+      ]
+    }, ['Injected by first plugin Injected by second plugin'], null, function () {
+      expect(eventFiredForFirstPlugin).toBe(true);
+      expect(eventFiredForSecondPlugin).toBe(true);
+      done();
+    }, false,
+    shouldExpectWarnings);
+  });
+
+  it('allows to modify sequentially the html during html-webpack-plugin-after-html-processing event either by edit the given arguments object or by return a new object in the callback', function (done) {
+    var eventFiredForFirstPlugin = false;
+    var eventFiredForSecondPlugin = false;
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForFirstPlugin = true;
+            var result = _.extend(object, {
+              html: object.html + 'Injected by first plugin'
+            });
+            callback(null, result);
+          });
+        });
+      }
+    };
+    var secondExamplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForSecondPlugin = true;
+            object.html += ' Injected by second plugin';
+            callback(null);
+          });
+        });
+      }
+    };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin,
+        secondExamplePlugin
+      ]
+    }, ['Injected by first plugin Injected by second plugin'], null, function () {
+      expect(eventFiredForFirstPlugin).toBe(true);
+      expect(eventFiredForSecondPlugin).toBe(true);
+      done();
+    }, false,
+    shouldExpectWarnings);
+  });
+
+  it('allows to modify sequentially the html during html-webpack-plugin-after-html-processing event by return a new object in the callback', function (done) {
+    var eventFiredForFirstPlugin = false;
+    var eventFiredForSecondPlugin = false;
+    var examplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForFirstPlugin = true;
+            var result = _.extend(object, {
+              html: object.html + 'Injected by first plugin'
+            });
+            callback(null, result);
+          });
+        });
+      }
+    };
+    var secondExamplePlugin = {
+      apply: function (compiler) {
+        compiler.plugin('compilation', function (compilation) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-after-html-processing', function (object, callback) {
+            eventFiredForSecondPlugin = true;
+            var result = _.extend(object, {
+              html: object.html + ' Injected by second plugin'
+            });
+            callback(null, result);
+          });
+        });
+      }
+    };
+
+    testHtmlPlugin({
+      entry: {
+        app: path.join(__dirname, 'fixtures/index.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin(),
+        examplePlugin,
+        secondExamplePlugin
+      ]
+    }, ['Injected by first plugin Injected by second plugin'], null, function () {
+      expect(eventFiredForFirstPlugin).toBe(true);
+      expect(eventFiredForSecondPlugin).toBe(true);
+      done();
     });
   });
 
@@ -875,7 +1199,7 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-before-html-processing', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-before-html-processing', function (object, callback) {
             eventFired = true;
             object.assets.js.push('funky-script.js');
             object.html += 'Injected by plugin';
@@ -884,6 +1208,8 @@ describe('HtmlWebpackPlugin', function () {
         });
       }
     };
+
+    var shouldExpectWarnings = webpackMajorVersion < 4;
     testHtmlPlugin({
       entry: {
         app: path.join(__dirname, 'fixtures/index.js')
@@ -899,7 +1225,8 @@ describe('HtmlWebpackPlugin', function () {
     }, ['Injected by plugin', '<script type="text/javascript" src="funky-script.js"'], null, function () {
       expect(eventFired).toBe(true);
       done();
-    });
+    }, false,
+    shouldExpectWarnings);
   });
 
   it('allows to modify the html during html-webpack-plugin-before-html-generation event', function (done) {
@@ -907,7 +1234,7 @@ describe('HtmlWebpackPlugin', function () {
     var examplePlugin = {
       apply: function (compiler) {
         compiler.plugin('compilation', function (compilation) {
-          compilation.plugin('html-webpack-plugin-before-html-generation', function (object, callback) {
+          tapCompilationEvent(compilation, 'html-webpack-plugin-before-html-generation', function (object, callback) {
             eventFired = true;
             object.assets.js.push('funky-script.js');
             callback();
@@ -926,7 +1253,7 @@ describe('HtmlWebpackPlugin', function () {
       plugins: [
         new HtmlWebpackPlugin({
           inject: false,
-          template: 'jade!' + path.join(__dirname, 'fixtures/template.jade')
+          template: 'jade-loader!' + path.join(__dirname, 'fixtures/template.jade')
         }),
         examplePlugin
       ]
@@ -938,8 +1265,6 @@ describe('HtmlWebpackPlugin', function () {
 
   it('works with commons chunk plugin', function (done) {
     testHtmlPlugin({
-      debug: true,
-      verbose: true,
       entry: {
         util: path.join(__dirname, 'fixtures/util.js'),
         index: path.join(__dirname, 'fixtures/index.js')
@@ -948,11 +1273,11 @@ describe('HtmlWebpackPlugin', function () {
         path: OUTPUT_DIR,
         filename: '[name]_bundle.js'
       },
+      __commonsChunk: {
+        name: 'common',
+        filename: 'common_bundle.js'
+      },
       plugins: [
-        new CommonsChunkPlugin({
-          name: 'common',
-          filename: 'common_bundle.js'
-        }),
         new HtmlWebpackPlugin()
       ]
     }, [
@@ -973,6 +1298,43 @@ describe('HtmlWebpackPlugin', function () {
         })
       ]
     }, [/<link rel="shortcut icon" href="[^"]+\.ico">/], null, done);
+  });
+
+  it('adds a meta tag', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          meta: {
+            'viewport': {
+              'name': 'viewport',
+              'content': 'width=device-width, initial-scale=1, shrink-to-fit=no'
+            }
+          }
+        })
+      ]
+    }, [/<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">/], null, done);
+  });
+
+  it('adds a meta tag with short notation', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          meta: {
+            'viewport': 'width=device-width, initial-scale=1, shrink-to-fit=no'
+          }
+        })
+      ]
+    }, [/<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">/], null, done);
   });
 
   it('adds a favicon with publicPath set to /some/', function (done) {
@@ -1005,6 +1367,22 @@ describe('HtmlWebpackPlugin', function () {
         })
       ]
     }, [/<link rel="shortcut icon" href="\/some\/+[^"]+\.ico">/], null, done);
+  });
+
+  it('adds a favicon with a publichPath set to [hash]/ and replaces the hash', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        publicPath: '/[hash]/',
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          favicon: path.join(__dirname, 'fixtures/favicon.ico')
+        })
+      ]
+    }, [/<link rel="shortcut icon" href="\/[a-z0-9]{20}\/favicon\.ico">/], null, done);
   });
 
   it('adds a favicon with inject enabled', function (done) {
@@ -1127,17 +1505,18 @@ describe('HtmlWebpackPlugin', function () {
         path: OUTPUT_DIR,
         filename: '[name]_bundle.js'
       },
+      __commonsChunk: {
+        name: 'common',
+        filename: 'common_bundle.js'
+      },
       plugins: [
-        new CommonsChunkPlugin({
-          name: 'common',
-          filename: 'common_bundle.js'
-        }),
         new HtmlWebpackPlugin({
           chunksSortMode: 'auto'
         })
       ]
     }, [
-      /<script type="text\/javascript" src="common_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">.+<script type="text\/javascript" src="index_bundle.js">/], null, done);
+      /(<script type="text\/javascript" src="common_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">.+<script type="text\/javascript" src="index_bundle.js">)|(<script type="text\/javascript" src="common_bundle.js">.+<script type="text\/javascript" src="index_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">)/
+    ], null, done);
   });
 
   it('should sort the chunks in custom (reverse alphabetical) order', function (done) {
@@ -1182,17 +1561,19 @@ describe('HtmlWebpackPlugin', function () {
           { test: /\.css$/, loader: 'css-loader' }
         ]
       },
+      __commonsChunk: {
+        name: 'common',
+        filename: 'common_bundle.js'
+      },
       plugins: [
-        new CommonsChunkPlugin({
-          name: 'common',
-          filename: 'common_bundle.js'
-        }),
         new HtmlWebpackPlugin({
           chunksSortMode: 'dependency'
         })
       ]
     }, [
-      /<script type="text\/javascript" src="common_bundle.js">.+<script type="text\/javascript" src="aTheme_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">/], null, done);
+      // theme and util don't depend on each other, so the order of those doesn't matter
+      /<script type="text\/javascript" src="common_bundle.js">.+(<script type="text\/javascript" src="aTheme_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">|<script type="text\/javascript" src="util_bundle.js">.+<script type="text\/javascript" src="aTheme_bundle.js">)/
+    ], null, done);
   });
 
   it('should sort the chunks by chunk dependencies even if a parent chunk is excluded', function (done) {
@@ -1210,18 +1591,51 @@ describe('HtmlWebpackPlugin', function () {
           { test: /\.css$/, loader: 'css-loader' }
         ]
       },
+      __commonsChunk: {
+        name: 'common',
+        filename: 'common_bundle.js'
+      },
       plugins: [
-        new CommonsChunkPlugin({
-          name: 'common',
-          filename: 'common_bundle.js'
-        }),
         new HtmlWebpackPlugin({
           chunksSortMode: 'dependency',
           excludeChunks: ['common']
         })
       ]
     }, [
-      /<script type="text\/javascript" src="aTheme_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">/], null, done);
+      // theme and util don't depend on each other, so the order of those doesn't matter
+      /(<script type="text\/javascript" src="aTheme_bundle.js">.+<script type="text\/javascript" src="util_bundle.js">|<script type="text\/javascript" src="util_bundle.js">.+<script type="text\/javascript" src="aTheme_bundle.js">)/
+    ], null, done);
+  });
+
+  it('should sort manually by the chunks', function (done) {
+    testHtmlPlugin({
+      entry: {
+        b: path.join(__dirname, 'fixtures/util.js'),
+        a: path.join(__dirname, 'fixtures/theme.js'),
+        d: path.join(__dirname, 'fixtures/util.js'),
+        c: path.join(__dirname, 'fixtures/theme.js')
+      },
+      output: {
+        path: OUTPUT_DIR,
+        filename: '[name]_bundle.js'
+      },
+      module: {
+        loaders: [
+          { test: /\.css$/, loader: 'css-loader' }
+        ]
+      },
+      __commonsChunk: {
+        name: 'common',
+        filename: 'common_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          chunksSortMode: 'manual',
+          chunks: ['common', 'a', 'b', 'c']
+        })
+      ]
+    }, [
+      /<script type="text\/javascript" src="common_bundle.js">.+<script type="text\/javascript" src="a_bundle.js">.+<script type="text\/javascript" src="b_bundle.js">.+<script type="text\/javascript" src="c_bundle.js">/], null, done);
   });
 
   it('should add the webpack compilation object as a property of the templateParam object', function (done) {
@@ -1237,7 +1651,60 @@ describe('HtmlWebpackPlugin', function () {
           inject: false
         })
       ]
-    }, ['templateParams.compilation exists: true'], null, done);
+    }, ['templateParams keys: "compilation,webpack,webpackConfig,htmlWebpackPlugin"'], null, done);
+  });
+
+  it('should allow to disable template parameters', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          template: path.join(__dirname, 'fixtures/templateParam.js'),
+          inject: false,
+          templateParameters: false
+        })
+      ]
+    }, ['templateParams keys: ""'], null, done);
+  });
+
+  it('should allow to set specific template parameters', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          template: path.join(__dirname, 'fixtures/templateParam.js'),
+          inject: false,
+          templateParameters: { foo: 'bar' }
+        })
+      ]
+    }, ['templateParams keys: "foo"'], null, done);
+  });
+
+  it('should allow to set specific template parameters using a function', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [
+        new HtmlWebpackPlugin({
+          template: path.join(__dirname, 'fixtures/templateParam.js'),
+          inject: false,
+          templateParameters: function () {
+            return { 'foo': 'bar' };
+          }
+        })
+      ]
+    }, ['templateParams keys: "foo"'], null, done);
   });
 
   it('should not treat templateContent set to an empty string as missing', function (done) {
@@ -1252,5 +1719,33 @@ describe('HtmlWebpackPlugin', function () {
       })]
     },
     [/^<script type="text\/javascript" src="app_bundle\.js"><\/script>$/], null, done);
+  });
+
+  it('allows you to inject the assets into the body of the given spaced closing tag template', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [new HtmlWebpackPlugin({
+        inject: 'body',
+        template: path.join(__dirname, 'fixtures/spaced_plain.html')
+      })]
+    }, [/<body>[\s]*<script type="text\/javascript" src="index_bundle.js"><\/script>[\s]*<\/body\s>/], null, done);
+  });
+
+  it('allows you to inject the assets into the head of the given spaced closing tag template', function (done) {
+    testHtmlPlugin({
+      entry: path.join(__dirname, 'fixtures/index.js'),
+      output: {
+        path: OUTPUT_DIR,
+        filename: 'index_bundle.js'
+      },
+      plugins: [new HtmlWebpackPlugin({
+        inject: 'head',
+        template: path.join(__dirname, 'fixtures/spaced_plain.html')
+      })]
+    }, [/<head>[\s]*<script type="text\/javascript" src="index_bundle.js"><\/script>[\s]*<\/head\s>/], null, done);
   });
 });
